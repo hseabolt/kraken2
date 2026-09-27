@@ -10,6 +10,8 @@ add_executable(build_db
 
 add_executable(classify
         classify.cc
+        rank_bin_resolver.cc
+        bin_writer.cc
         reports.cc
         mmap_file.cc
         compact_hash.cc

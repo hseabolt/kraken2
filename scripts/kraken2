@@ -49,6 +49,9 @@ my $use_mpa_style = 0;
 my $report_zero_counts = 0;
 my $minimum_hit_groups = 2;
 my $report_minimizer_data = 0;
+my $bin_out;
+my $bin_rank;
+my $max_open_bin_files;
 
 GetOptions(
   "help" => \&display_help,
@@ -72,6 +75,9 @@ GetOptions(
   "report-zero-counts" => \$report_zero_counts,
   "minimum-hit-groups=i" => \$minimum_hit_groups,
   "report-minimizer-data" => \$report_minimizer_data,
+  "bin-out=s" => \$bin_out,
+  "bin-rank=s" => \$bin_rank,
+  "max-open-bin-files=i" => \$max_open_bin_files,
 );
 
 if (! defined $threads) {
@@ -115,6 +121,13 @@ if ($minimum_hit_groups < 0) {
   die "$PROG: minimum number of hit groups must be nonnegative\n";
 }
 
+if (defined($bin_out) != defined($bin_rank)) {
+  die "$PROG: --bin-out and --bin-rank must be used together\n";
+}
+if (defined($max_open_bin_files) && $max_open_bin_files < 2) {
+  die "$PROG: --max-open-bin-files must be at least 2\n";
+}
+
 my $auto_detect = ! $compressed;
 if ($auto_detect) {
   auto_detect_file_format();
@@ -140,6 +153,9 @@ push @flags, "-z" if $report_zero_counts;
 push @flags, "-M" if $memory_mapping;
 push @flags, "-g", $minimum_hit_groups;
 push @flags, "-K" if $report_minimizer_data;
+push @flags, "-B", $bin_out if defined $bin_out;
+push @flags, "-r", $bin_rank if defined $bin_rank;
+push @flags, "-L", $max_open_bin_files if defined $max_open_bin_files;
 
 # Stupid hack to keep filehandles from closing before exec
 # filehandles opened inside for loop below go out of scope
@@ -216,6 +232,9 @@ Options:
                           Minimum number of hit groups (overlapping k-mers
                           sharing the same minimizer) needed to make a call
                           (default: $minimum_hit_groups)
+  --bin-out DIR            Write classified reads into taxonomic bins under DIR
+  --bin-rank RANK          Rank used for --bin-out (e.g. genus, species, family)
+  --max-open-bin-files NUM Maximum simultaneously open bin files (default: 128)
   --help                  Print this message
   --version               Print version information
 

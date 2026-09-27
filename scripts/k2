@@ -58,6 +58,9 @@ AMBIGUOUS_TAXID = 2**32 - 1
 
 WRAPPER_ARGS_TO_BIN_ARGS = {
     "block_size": "-B",
+    "bin_out": "-B",
+    "bin_rank": "-r",
+    "max_open_bin_files": "-L",
     "classified_out": "-C",
     "check_pair_order": "-c",
     "confidence": "-T",
@@ -4149,6 +4152,12 @@ def classify(args):
             )
         )
         sys.exit(1)
+    if hasattr(args, "bin_out") != hasattr(args, "bin_rank"):
+        LOG.error("--bin-out and --bin-rank must be used together\n")
+        sys.exit(1)
+    if hasattr(args, "max_open_bin_files") and args.max_open_bin_files < 2:
+        LOG.error("--max-open-bin-files must be at least 2\n")
+        sys.exit(1)
     argv = [
         classify_bin,
         "-H",
@@ -4920,6 +4929,27 @@ def make_classify_parser(subparsers):
         help="Print classified sequences to filename",
     )
     parser.add_argument(
+        "--bin-out",
+        type=str,
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        help="Write classified reads into taxonomic bins under DIR",
+    )
+    parser.add_argument(
+        "--bin-rank",
+        type=str,
+        metavar="RANK",
+        default=argparse.SUPPRESS,
+        help="Taxonomic rank used for --bin-out (e.g. genus, species, family)",
+    )
+    parser.add_argument(
+        "--max-open-bin-files",
+        type=int,
+        metavar="INT",
+        default=argparse.SUPPRESS,
+        help="Maximum simultaneously open bin files (default: 128)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         metavar="FILENAME",
@@ -5347,6 +5377,9 @@ def k2_main():
             partitions = find_partitioned_databases(args.db[0])
             args.db = partitions if partitions else args.db
         if len(args.db) > 1:
+            if hasattr(args, "bin_out") or hasattr(args, "bin_rank"):
+                LOG.error("Taxonomic read binning is supported for a single Kraken database in milestone 1; multi-database binning must occur after merged classification.\n")
+                sys.exit(1)
             classify_multi_dbs(args)
         else:
             args.db = args.db[0]

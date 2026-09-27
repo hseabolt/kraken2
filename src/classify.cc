@@ -18,6 +18,8 @@
 #include "aa_translate.h"
 #include "reports.h"
 #include "utilities.h"
+#include "rank_bin_resolver.h"
+#include "bin_writer.h"
 using namespace kraken2;
 
 using std::cerr;
@@ -72,6 +74,10 @@ struct Options {
   string unclassified_output_filename;
   string kraken_output_filename;
   string taxon_counters_dump_filename;
+  string bin_output_directory;
+  string bin_rank;
+  bool binning_enabled;
+  size_t max_open_bin_files;
   bool mpa_style_report;
   bool report_kmer_data;
   bool quick_mode;
@@ -106,6 +112,10 @@ struct Options {
     use_memory_mapping = false;
     daemon_mode = false;
     check_pair_order = false;
+    binning_enabled = false;
+    max_open_bin_files = 128;
+    bin_output_directory.clear();
+    bin_rank.clear();
 
     index_filename.clear();
     taxonomy_filename.clear();
@@ -143,6 +153,7 @@ public:
   string classified_out2_str;
   string unclassified_out1_str;
   string unclassified_out2_str;
+  vector<BinBlock> bin_blocks;
 };
 
 void ParseCommandLine(int argc, char **argv, Options &opts);
@@ -150,7 +161,8 @@ void usage(int exit_code=EX_USAGE);
 void ProcessFiles(const char *filename1, const char *filename2,
     KeyValueStore *hash, Taxonomy &tax,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-    OutputStreamData &outputs, taxon_counters_t &total_taxon_counters);
+    OutputStreamData &outputs, taxon_counters_t &total_taxon_counters,
+    RankBinResolver *bin_resolver, BinWriter *bin_writer);
 taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
     KeyValueStore *hash, Taxonomy &tax, IndexOptions &idx_opts,
     Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
@@ -317,6 +329,14 @@ void classify(Options &opts, IndexData *index_data) {
   ClassificationStats stats = {0, 0, 0};
 
   OutputStreamData outputs = { false, false, nullptr, nullptr, nullptr, nullptr, &std::cout };
+  RankBinResolver *bin_resolver = nullptr;
+  BinWriter *bin_writer = nullptr;
+  if (opts.binning_enabled) {
+    bin_resolver = new RankBinResolver(taxonomy, opts.bin_rank);
+    bin_writer = new BinWriter(taxonomy, opts.bin_output_directory,
+                               bin_resolver->target_rank(),
+                               opts.max_open_bin_files);
+  }
   if (opts.use_translated_search) {
     initLookUpTables();
   }
@@ -326,7 +346,8 @@ void classify(Options &opts, IndexData *index_data) {
   if (opts.filenames.empty()) {
     if (opts.paired_end_processing && ! opts.single_file_pairs)
       errx(EX_USAGE, "paired end processing used with no files specified");
-    ProcessFiles(nullptr, nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+    ProcessFiles(nullptr, nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
+                     bin_resolver, bin_writer);
   }
   else {
     for (size_t i = 0; i < opts.filenames.size(); i++) {
@@ -334,13 +355,23 @@ void classify(Options &opts, IndexData *index_data) {
         if (i + 1 == opts.filenames.size()) {
           errx(EX_USAGE, "paired end processing used with unpaired file");
         }
-        ProcessFiles(opts.filenames[i], opts.filenames[i+1], hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+        ProcessFiles(opts.filenames[i], opts.filenames[i+1], hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
+                     bin_resolver, bin_writer);
         i += 1;
       } else {
-        ProcessFiles(opts.filenames[i], nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+        ProcessFiles(opts.filenames[i], nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
+                     bin_resolver, bin_writer);
       }
     }
   }
+  if (bin_writer != nullptr) {
+    bin_writer->Finalize();
+    delete bin_writer;
+    bin_writer = nullptr;
+  }
+  delete bin_resolver;
+  bin_resolver = nullptr;
+
   gettimeofday(&tv2, nullptr);
 
   // delete hash_ptr;
@@ -491,7 +522,8 @@ void ProcessFiles(const char *filename1, const char *filename2,
     KeyValueStore *hash, Taxonomy &tax,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
     OutputStreamData &outputs,
-    taxon_counters_t &total_taxon_counters)
+    taxon_counters_t &total_taxon_counters,
+    RankBinResolver *bin_resolver, BinWriter *bin_writer)
 {
   // The priority queue for output is designed to ensure fragment data
   // is output in the same order it was input
@@ -523,6 +555,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
     uint64_t block_id;
     OutputData out_data;
     taxon_counters_t thread_taxon_counters;
+    map<taxid_t, BinBlock> bin_buffers;
 
     while (true) {
       thread_stats.total_sequences = 0;
@@ -563,6 +596,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
       u1_oss.str("");
       u2_oss.str("");
       thread_taxon_counters.clear();
+      bin_buffers.clear();
 
       while ((seq1 = reader1.NextSequence()) != NULL) {
         auto valid_fragment = true;
@@ -586,6 +620,15 @@ void ProcessFiles(const char *filename1, const char *filename2,
                seq2->header.c_str());
         }
         thread_stats.total_sequences++;
+
+        // Bins preserve original input records before optional quality masking
+        // and before Kraken appends kraken:taxid to classified-output headers.
+        string original_bin_seq1, original_bin_seq2;
+        if (opts.binning_enabled && opts.minimum_quality_score > 0) {
+          original_bin_seq1.assign(seq1->to_string());
+          if (opts.paired_end_processing)
+            original_bin_seq2.assign(seq2->to_string());
+        }
         if (opts.minimum_quality_score > 0) {
           MaskLowQualityBases(*seq1, opts.minimum_quality_score);
           if (opts.paired_end_processing)
@@ -604,6 +647,26 @@ void ProcessFiles(const char *filename1, const char *filename2,
                                   translated_frames, thread_taxon_counters);
         }
         if (call) {
+          if (opts.binning_enabled && bin_resolver != nullptr) {
+            if (opts.minimum_quality_score == 0) {
+              original_bin_seq1.assign(seq1->to_string());
+              if (opts.paired_end_processing)
+                original_bin_seq2.assign(seq2->to_string());
+            }
+
+            const taxid_t bin_taxon = bin_resolver->Resolve(call);
+            BinBlock &bin_block = bin_buffers[bin_taxon];
+            bin_block.taxon = bin_taxon;
+            bin_block.mate1_data.append(original_bin_seq1);
+            if (opts.paired_end_processing)
+              bin_block.mate2_data.append(original_bin_seq2);
+            bin_block.fragments++;
+            bin_block.reads += opts.paired_end_processing ? 2 : 1;
+            bin_block.bases += seq1->seq.size();
+            if (opts.paired_end_processing)
+              bin_block.bases += seq2->seq.size();
+          }
+
           char buffer[1024] = "";
           sprintf(buffer, " kraken:taxid|%llu",
               (unsigned long long) tax.nodes()[call].external_id);
@@ -649,6 +712,11 @@ void ProcessFiles(const char *filename1, const char *filename2,
       out_data.classified_out2_str.assign(c2_oss.str());
       out_data.unclassified_out1_str.assign(u1_oss.str());
       out_data.unclassified_out2_str.assign(u2_oss.str());
+      out_data.bin_blocks.clear();
+      out_data.bin_blocks.reserve(bin_buffers.size());
+      for (auto &kv_pair : bin_buffers)
+        out_data.bin_blocks.push_back(std::move(kv_pair.second));
+
 
       #pragma omp critical(output_queue)
       {
@@ -707,6 +775,10 @@ void ProcessFiles(const char *filename1, const char *filename2,
           (*outputs.unclassified_output1) << out_data.unclassified_out1_str;
         if (outputs.unclassified_output2 != nullptr)
           (*outputs.unclassified_output2) << out_data.unclassified_out2_str;
+        if (bin_writer != nullptr && !out_data.bin_blocks.empty()) {
+          bin_writer->Initialize(reader1.file_format(), opts.paired_end_processing);
+          bin_writer->WriteBlocks(out_data.bin_blocks);
+        }
         omp_unset_lock(&output_lock);
       }  // end while output loop
     } // end while
@@ -1093,7 +1165,7 @@ void MaskLowQualityBases(Sequence &dna, int minimum_quality_score) {
 void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDc")) != -1) {
+  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDcB:r:L:")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -1170,6 +1242,18 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
       case 'd':
         opts.taxon_counters_dump_filename = optarg;
         break;
+      case 'B':
+        opts.bin_output_directory = optarg;
+        opts.binning_enabled = true;
+        break;
+      case 'r':
+        opts.bin_rank = optarg;
+        break;
+      case 'L':
+        opts.max_open_bin_files = std::stoul(optarg);
+        if (opts.max_open_bin_files < 2)
+          errx(EX_USAGE, "max open bin files must be at least 2");
+        break;
     }
   }
 
@@ -1185,6 +1269,15 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     warnx("-m requires -R be used");
     usage();
   }
+  if (!opts.bin_output_directory.empty() && opts.bin_rank.empty()) {
+    warnx("-B/--bin-out requires -r/--bin-rank");
+    usage();
+  }
+  if (opts.bin_output_directory.empty() && !opts.bin_rank.empty()) {
+    warnx("-r/--bin-rank requires -B/--bin-out");
+    usage();
+  }
+
 
   for (int i = optind; i < argc; i++) {
     opts.filenames.push_back(argv[i]);
@@ -1215,6 +1308,9 @@ void usage(int exit_code) {
        << "  -g NUM           Minimum number of hit groups needed for call" << endl
        << "  -C filename      Filename/format to have classified sequences" << endl
        << "  -U filename      Filename/format to have unclassified sequences" << endl
+       << "  -B directory     Write classified reads to taxonomic bin files" << endl
+       << "  -r rank          Taxonomic rank for -B bins (e.g. genus, species)" << endl
+       << "  -L NUM           Maximum simultaneously open bin files (def. 128)" << endl
        << "  -O filename      Output file for normal Kraken output" << endl
        << "  -K               In comb. w/ -R, provide minimizer information in report" << endl
        << "  -D               Start a daemon, this options is intended to be used with wrappers" << std::endl
