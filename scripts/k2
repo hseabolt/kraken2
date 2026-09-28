@@ -61,6 +61,10 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
     "bin_out": "-B",
     "bin_rank": "-r",
     "max_open_bin_files": "-L",
+    "bin_compression": "-Z",
+    "bin_compression_level": "-l",
+    "bin_min_fragments": "-f",
+    "bin_unresolved": "-W",
     "classified_out": "-C",
     "check_pair_order": "-c",
     "confidence": "-T",
@@ -3968,8 +3972,110 @@ def find_partitioned_databases(db):
     return databases
 
 
+
+BINNING_ARG_NAMES = (
+    "bin_out", "bin_rank", "max_open_bin_files", "bin_compression",
+    "bin_compression_level", "bin_min_fragments", "bin_include_clade",
+    "bin_exclude_clade", "bin_unresolved",
+)
+
+def validate_bin_args(args):
+    has_out = hasattr(args, "bin_out") and args.bin_out is not None
+    has_rank = hasattr(args, "bin_rank") and args.bin_rank is not None
+    if has_out != has_rank:
+        LOG.error("--bin-out and --bin-rank must be used together\n")
+        sys.exit(1)
+    tuning = any(hasattr(args, name) for name in BINNING_ARG_NAMES[2:])
+    if tuning and not (has_out and has_rank):
+        LOG.error("bin tuning options require --bin-out and --bin-rank\n")
+        sys.exit(1)
+    if hasattr(args, "max_open_bin_files") and args.max_open_bin_files < 2:
+        LOG.error("--max-open-bin-files must be at least 2\n")
+        sys.exit(1)
+    if hasattr(args, "bin_compression_level") and not 1 <= args.bin_compression_level <= 9:
+        LOG.error("--bin-compression-level must be between 1 and 9\n")
+        sys.exit(1)
+    if hasattr(args, "bin_min_fragments") and args.bin_min_fragments < 1:
+        LOG.error("--bin-min-fragments must be at least 1\n")
+        sys.exit(1)
+    return has_out and has_rank
+
+def pop_bin_config(args):
+    validate_bin_args(args)
+    config = {}
+    for name in BINNING_ARG_NAMES:
+        if hasattr(args, name):
+            config[name] = getattr(args, name)
+            delattr(args, name)
+    return config
+
+def restore_bin_config(args, config):
+    for name, value in config.items():
+        setattr(args, name, value)
+
+def run_bin_reads(args, config, taxonomy_pathname, kraken_filename, filenames):
+    if not config or "bin_out" not in config:
+        return
+    bin_reads = find_kraken2_binary("bin_reads")
+    argv = [
+        bin_reads,
+        "-t", taxonomy_pathname,
+        "-k", kraken_filename,
+        "-B", config["bin_out"],
+        "-r", config["bin_rank"],
+    ]
+    scalar_flags = (
+        ("max_open_bin_files", "-L"),
+        ("bin_compression", "-Z"),
+        ("bin_compression_level", "-l"),
+        ("bin_min_fragments", "-f"),
+        ("bin_unresolved", "-W"),
+    )
+    for name, flag in scalar_flags:
+        if name in config:
+            argv.extend([flag, str(config[name])])
+    for taxid in config.get("bin_include_clade", []):
+        argv.extend(["-I", str(taxid)])
+    for taxid in config.get("bin_exclude_clade", []):
+        argv.extend(["-E", str(taxid)])
+    paired = hasattr(args, "paired") and args.paired
+    interleaved = hasattr(args, "interleaved") and args.interleaved
+    if paired:
+        argv.append("-P")
+    elif interleaved:
+        argv.append("-S")
+
+    if any([is_compressed(filename) for filename in filenames]):
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            fifo1 = os.path.join(temp_dir_name, "bin_fifo1")
+            os.mkfifo(fifo1, 0o600)
+            fifo2 = None
+            if paired:
+                fifo2 = os.path.join(temp_dir_name, "bin_fifo2")
+                os.mkfifo(fifo2, 0o600)
+                argv.extend([fifo1, fifo2])
+            else:
+                argv.append(fifo1)
+            proc = subprocess.Popen(argv)
+            if paired:
+                writer1 = threading.Thread(target=write_to_fifo, args=(filenames[0::2], fifo1))
+                writer2 = threading.Thread(target=write_to_fifo, args=(filenames[1::2], fifo2))
+                writer1.start(); writer2.start()
+                writer1.join(); writer2.join()
+            else:
+                write_to_fifo(filenames, fifo1)
+            rc = proc.wait()
+            if rc != 0:
+                LOG.error("bin_reads failed with exit code {}\n".format(rc))
+                sys.exit(rc)
+    else:
+        argv.extend([os.path.abspath(filename) for filename in filenames])
+        subprocess.check_call(argv)
+
 def classify_multi_dbs(args, filenames=[]):
     dbs = args.db
+    original_filenames = list(args.filenames) if hasattr(args, "filenames") else []
+    bin_config = pop_bin_config(args)
     use_names = False
     report_zeroes = False
     report_filename = None
@@ -4095,6 +4201,10 @@ def classify_multi_dbs(args, filenames=[]):
 
     # Add space to overwrite progress bar
     LOG.info("Finished merging output files              \n")
+    if bin_config:
+        LOG.info("Writing taxonomic read bins from final merged classifications\n")
+        run_bin_reads(args, bin_config, taxonomy_pathname, out_filename, original_filenames)
+        LOG.info("Finished writing taxonomic read bins\n")
     if output:
         shutil.move(out_filename, os.path.abspath(output))
     else:
@@ -4134,6 +4244,7 @@ def classify_multi_dbs(args, filenames=[]):
     os.remove(classified_headers_filename)
     os.remove(taxonomy_pathname)
     os.remove(seqid2taxid_map_pathname)
+    restore_bin_config(args, bin_config)
 
 
 def classify(args):
@@ -4152,12 +4263,7 @@ def classify(args):
             )
         )
         sys.exit(1)
-    if hasattr(args, "bin_out") != hasattr(args, "bin_rank"):
-        LOG.error("--bin-out and --bin-rank must be used together\n")
-        sys.exit(1)
-    if hasattr(args, "max_open_bin_files") and args.max_open_bin_files < 2:
-        LOG.error("--max-open-bin-files must be at least 2\n")
-        sys.exit(1)
+    validate_bin_args(args)
     argv = [
         classify_bin,
         "-H",
@@ -4168,6 +4274,10 @@ def classify(args):
         os.path.join(database_path, "opts.k2d"),
     ]
     wrapper_args_to_binary_args(args, argv, get_binary_options(classify_bin))
+    for taxid in getattr(args, "bin_include_clade", []):
+        argv.extend(["-I", str(taxid)])
+    for taxid in getattr(args, "bin_exclude_clade", []):
+        argv.extend(["-E", str(taxid)])
     if any([is_compressed(filename) for filename in args.filenames]):
         with tempfile.TemporaryDirectory() as temp_dir_name:
             fifo1_pathname = os.path.join(temp_dir_name, "fifo1")
@@ -4950,6 +5060,48 @@ def make_classify_parser(subparsers):
         help="Maximum simultaneously open bin files (default: 128)",
     )
     parser.add_argument(
+        "--bin-compression",
+        choices=["none", "gzip"],
+        default=argparse.SUPPRESS,
+        help="Compress bin outputs (default: none)",
+    )
+    parser.add_argument(
+        "--bin-compression-level",
+        type=int,
+        metavar="INT",
+        default=argparse.SUPPRESS,
+        help="gzip compression level 1-9 (default: 1)",
+    )
+    parser.add_argument(
+        "--bin-min-fragments",
+        type=int,
+        metavar="INT",
+        default=argparse.SUPPRESS,
+        help="Remove bins containing fewer than INT fragments",
+    )
+    parser.add_argument(
+        "--bin-include-clade",
+        type=int,
+        action="append",
+        metavar="TAXID",
+        default=argparse.SUPPRESS,
+        help="Include only bins within TAXID clade; repeatable",
+    )
+    parser.add_argument(
+        "--bin-exclude-clade",
+        type=int,
+        action="append",
+        metavar="TAXID",
+        default=argparse.SUPPRESS,
+        help="Exclude bins within TAXID clade; repeatable; exclusion wins",
+    )
+    parser.add_argument(
+        "--bin-unresolved",
+        choices=["write", "drop"],
+        default=argparse.SUPPRESS,
+        help="Policy for classified reads unresolved at requested rank (default: write)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         metavar="FILENAME",
@@ -5273,7 +5425,11 @@ class Logger:
     queue_handler_setup = False
 
     def __init__(self, filename):
-        self.queue = multiprocessing.Manager().Queue(-1)
+        # Python 3.14 changed the POSIX multiprocessing default to forkserver.
+        # Use an explicit spawn context for the logging Manager so k2 does
+        # not depend on the interpreter/platform default start method.
+        self._manager = multiprocessing.get_context("spawn").Manager()
+        self.queue = self._manager.Queue(-1)
         logging.StreamHandler.terminator = ""
         self.logger = logging.getLogger("kraken2")
 
@@ -5377,9 +5533,6 @@ def k2_main():
             partitions = find_partitioned_databases(args.db[0])
             args.db = partitions if partitions else args.db
         if len(args.db) > 1:
-            if hasattr(args, "bin_out") or hasattr(args, "bin_rank"):
-                LOG.error("Taxonomic read binning is supported for a single Kraken database in milestone 1; multi-database binning must occur after merged classification.\n")
-                sys.exit(1)
             classify_multi_dbs(args)
         else:
             args.db = args.db[0]
@@ -5472,8 +5625,17 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     except Exception:
-        LOG.stop_thread()
-        LOG.error(traceback.format_exc())
+        # Logger construction can itself fail.  Do not mask the original
+        # exception by assuming LOG is already a Logger instance.
+        if hasattr(LOG, "stop_thread"):
+            try:
+                LOG.stop_thread()
+            except Exception:
+                pass
+        if hasattr(LOG, "error"):
+            LOG.error(traceback.format_exc())
+        else:
+            sys.stderr.write(traceback.format_exc())
         sys.exit(1)
     # else:
     #     LOG.stop_thread()

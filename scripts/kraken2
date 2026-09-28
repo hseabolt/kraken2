@@ -52,6 +52,12 @@ my $report_minimizer_data = 0;
 my $bin_out;
 my $bin_rank;
 my $max_open_bin_files;
+my $bin_compression;
+my $bin_compression_level;
+my $bin_min_fragments;
+my @bin_include_clades;
+my @bin_exclude_clades;
+my $bin_unresolved;
 
 GetOptions(
   "help" => \&display_help,
@@ -78,6 +84,12 @@ GetOptions(
   "bin-out=s" => \$bin_out,
   "bin-rank=s" => \$bin_rank,
   "max-open-bin-files=i" => \$max_open_bin_files,
+  "bin-compression=s" => \$bin_compression,
+  "bin-compression-level=i" => \$bin_compression_level,
+  "bin-min-fragments=i" => \$bin_min_fragments,
+  "bin-include-clade=i@" => \@bin_include_clades,
+  "bin-exclude-clade=i@" => \@bin_exclude_clades,
+  "bin-unresolved=s" => \$bin_unresolved,
 );
 
 if (! defined $threads) {
@@ -128,6 +140,24 @@ if (defined($max_open_bin_files) && $max_open_bin_files < 2) {
   die "$PROG: --max-open-bin-files must be at least 2\n";
 }
 
+if (defined($bin_compression) && $bin_compression ne "none" && $bin_compression ne "gzip") {
+  die "$PROG: --bin-compression must be none or gzip\n";
+}
+if (defined($bin_compression_level) && ($bin_compression_level < 1 || $bin_compression_level > 9)) {
+  die "$PROG: --bin-compression-level must be between 1 and 9\n";
+}
+if (defined($bin_min_fragments) && $bin_min_fragments < 1) {
+  die "$PROG: --bin-min-fragments must be at least 1\n";
+}
+if (defined($bin_unresolved) && $bin_unresolved ne "write" && $bin_unresolved ne "drop") {
+  die "$PROG: --bin-unresolved must be write or drop\n";
+}
+my $has_bin_tuning = defined($bin_compression) || defined($bin_compression_level) ||
+  defined($bin_min_fragments) || @bin_include_clades || @bin_exclude_clades || defined($bin_unresolved);
+if ($has_bin_tuning && (!defined($bin_out) || !defined($bin_rank))) {
+  die "$PROG: bin tuning options require --bin-out and --bin-rank\n";
+}
+
 my $auto_detect = ! $compressed;
 if ($auto_detect) {
   auto_detect_file_format();
@@ -156,6 +186,12 @@ push @flags, "-K" if $report_minimizer_data;
 push @flags, "-B", $bin_out if defined $bin_out;
 push @flags, "-r", $bin_rank if defined $bin_rank;
 push @flags, "-L", $max_open_bin_files if defined $max_open_bin_files;
+push @flags, "-Z", $bin_compression if defined $bin_compression;
+push @flags, "-l", $bin_compression_level if defined $bin_compression_level;
+push @flags, "-f", $bin_min_fragments if defined $bin_min_fragments;
+for my $taxid (@bin_include_clades) { push @flags, "-I", $taxid; }
+for my $taxid (@bin_exclude_clades) { push @flags, "-E", $taxid; }
+push @flags, "-W", $bin_unresolved if defined $bin_unresolved;
 
 # Stupid hack to keep filehandles from closing before exec
 # filehandles opened inside for loop below go out of scope
@@ -235,6 +271,13 @@ Options:
   --bin-out DIR            Write classified reads into taxonomic bins under DIR
   --bin-rank RANK          Rank used for --bin-out (e.g. genus, species, family)
   --max-open-bin-files NUM Maximum simultaneously open bin files (default: 128)
+  --bin-compression STR     none or gzip (default: none)
+  --bin-compression-level N gzip level 1-9 (default: 1)
+  --bin-min-fragments N     Remove bins with fewer than N fragments
+  --bin-include-clade TAXID Include only bins within clade (repeatable)
+  --bin-exclude-clade TAXID Exclude bins within clade (repeatable)
+  --bin-unresolved STR      write or drop unresolved-at-rank reads
+                            --bin-rank taxid keeps exact classified taxids
   --help                  Print this message
   --version               Print version information
 

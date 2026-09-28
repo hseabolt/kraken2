@@ -19,6 +19,7 @@
 #include "reports.h"
 #include "utilities.h"
 #include "rank_bin_resolver.h"
+#include "bin_selector.h"
 #include "bin_writer.h"
 using namespace kraken2;
 
@@ -78,6 +79,12 @@ struct Options {
   string bin_rank;
   bool binning_enabled;
   size_t max_open_bin_files;
+  string bin_compression;
+  int bin_compression_level;
+  uint64_t bin_min_fragments;
+  bool bin_write_unresolved;
+  vector<uint64_t> bin_include_taxids;
+  vector<uint64_t> bin_exclude_taxids;
   bool mpa_style_report;
   bool report_kmer_data;
   bool quick_mode;
@@ -114,6 +121,12 @@ struct Options {
     check_pair_order = false;
     binning_enabled = false;
     max_open_bin_files = 128;
+    bin_compression = "none";
+    bin_compression_level = 1;
+    bin_min_fragments = 1;
+    bin_write_unresolved = true;
+    bin_include_taxids.clear();
+    bin_exclude_taxids.clear();
     bin_output_directory.clear();
     bin_rank.clear();
 
@@ -162,7 +175,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
     KeyValueStore *hash, Taxonomy &tax,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
     OutputStreamData &outputs, taxon_counters_t &total_taxon_counters,
-    RankBinResolver *bin_resolver, BinWriter *bin_writer);
+    RankBinResolver *bin_resolver, BinSelector *bin_selector, BinWriter *bin_writer);
 taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
     KeyValueStore *hash, Taxonomy &tax, IndexOptions &idx_opts,
     Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
@@ -330,12 +343,17 @@ void classify(Options &opts, IndexData *index_data) {
 
   OutputStreamData outputs = { false, false, nullptr, nullptr, nullptr, nullptr, &std::cout };
   RankBinResolver *bin_resolver = nullptr;
+  BinSelector *bin_selector = nullptr;
   BinWriter *bin_writer = nullptr;
   if (opts.binning_enabled) {
     bin_resolver = new RankBinResolver(taxonomy, opts.bin_rank);
+    bin_selector = new BinSelector(taxonomy, opts.bin_include_taxids,
+                                   opts.bin_exclude_taxids);
     bin_writer = new BinWriter(taxonomy, opts.bin_output_directory,
                                bin_resolver->target_rank(),
-                               opts.max_open_bin_files);
+                               opts.max_open_bin_files, opts.bin_compression,
+                               opts.bin_compression_level,
+                               opts.bin_min_fragments, opts.bin_write_unresolved);
   }
   if (opts.use_translated_search) {
     initLookUpTables();
@@ -347,7 +365,7 @@ void classify(Options &opts, IndexData *index_data) {
     if (opts.paired_end_processing && ! opts.single_file_pairs)
       errx(EX_USAGE, "paired end processing used with no files specified");
     ProcessFiles(nullptr, nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
-                     bin_resolver, bin_writer);
+                     bin_resolver, bin_selector, bin_writer);
   }
   else {
     for (size_t i = 0; i < opts.filenames.size(); i++) {
@@ -356,11 +374,11 @@ void classify(Options &opts, IndexData *index_data) {
           errx(EX_USAGE, "paired end processing used with unpaired file");
         }
         ProcessFiles(opts.filenames[i], opts.filenames[i+1], hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
-                     bin_resolver, bin_writer);
+                     bin_resolver, bin_selector, bin_writer);
         i += 1;
       } else {
         ProcessFiles(opts.filenames[i], nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters,
-                     bin_resolver, bin_writer);
+                     bin_resolver, bin_selector, bin_writer);
       }
     }
   }
@@ -369,6 +387,8 @@ void classify(Options &opts, IndexData *index_data) {
     delete bin_writer;
     bin_writer = nullptr;
   }
+  delete bin_selector;
+  bin_selector = nullptr;
   delete bin_resolver;
   bin_resolver = nullptr;
 
@@ -523,7 +543,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
     OutputStreamData &outputs,
     taxon_counters_t &total_taxon_counters,
-    RankBinResolver *bin_resolver, BinWriter *bin_writer)
+    RankBinResolver *bin_resolver, BinSelector *bin_selector, BinWriter *bin_writer)
 {
   // The priority queue for output is designed to ensure fragment data
   // is output in the same order it was input
@@ -655,16 +675,22 @@ void ProcessFiles(const char *filename1, const char *filename2,
             }
 
             const taxid_t bin_taxon = bin_resolver->Resolve(call);
-            BinBlock &bin_block = bin_buffers[bin_taxon];
-            bin_block.taxon = bin_taxon;
-            bin_block.mate1_data.append(original_bin_seq1);
-            if (opts.paired_end_processing)
-              bin_block.mate2_data.append(original_bin_seq2);
-            bin_block.fragments++;
-            bin_block.reads += opts.paired_end_processing ? 2 : 1;
-            bin_block.bases += seq1->seq.size();
-            if (opts.paired_end_processing)
-              bin_block.bases += seq2->seq.size();
+            const bool selected =
+                (bin_taxon == 0 && opts.bin_write_unresolved) ||
+                (bin_taxon != 0 && bin_selector != nullptr &&
+                 bin_selector->Allows(bin_taxon));
+            if (selected) {
+              BinBlock &bin_block = bin_buffers[bin_taxon];
+              bin_block.taxon = bin_taxon;
+              bin_block.mate1_data.append(original_bin_seq1);
+              if (opts.paired_end_processing)
+                bin_block.mate2_data.append(original_bin_seq2);
+              bin_block.fragments++;
+              bin_block.reads += opts.paired_end_processing ? 2 : 1;
+              bin_block.bases += seq1->seq.size();
+              if (opts.paired_end_processing)
+                bin_block.bases += seq2->seq.size();
+            }
           }
 
           char buffer[1024] = "";
@@ -1165,7 +1191,7 @@ void MaskLowQualityBases(Sequence &dna, int minimum_quality_score) {
 void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
 
-  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDcB:r:L:")) != -1) {
+  while ((opt = getopt(argc, argv, "h?H:t:o:T:p:R:C:U:O:Q:g:d:nmzqPSMKDcB:r:L:Z:l:f:I:E:W:")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -1254,6 +1280,37 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         if (opts.max_open_bin_files < 2)
           errx(EX_USAGE, "max open bin files must be at least 2");
         break;
+      case 'Z':
+        opts.bin_compression = optarg;
+        if (opts.bin_compression != "none" && opts.bin_compression != "gzip")
+          errx(EX_USAGE, "bin compression must be 'none' or 'gzip'");
+        break;
+      case 'l':
+        opts.bin_compression_level = std::stoi(optarg);
+        if (opts.bin_compression_level < 1 || opts.bin_compression_level > 9)
+          errx(EX_USAGE, "bin compression level must be in [1,9]");
+        break;
+      case 'f':
+        opts.bin_min_fragments = std::stoull(optarg);
+        if (opts.bin_min_fragments < 1)
+          errx(EX_USAGE, "minimum bin fragments must be at least 1");
+        break;
+      case 'I':
+        opts.bin_include_taxids.push_back(std::stoull(optarg));
+        break;
+      case 'E':
+        opts.bin_exclude_taxids.push_back(std::stoull(optarg));
+        break;
+      case 'W': {
+        string unresolved_mode(optarg);
+        if (unresolved_mode == "write")
+          opts.bin_write_unresolved = true;
+        else if (unresolved_mode == "drop")
+          opts.bin_write_unresolved = false;
+        else
+          errx(EX_USAGE, "bin unresolved policy must be 'write' or 'drop'");
+        break;
+      }
     }
   }
 
@@ -1311,6 +1368,12 @@ void usage(int exit_code) {
        << "  -B directory     Write classified reads to taxonomic bin files" << endl
        << "  -r rank          Taxonomic rank for -B bins (e.g. genus, species)" << endl
        << "  -L NUM           Maximum simultaneously open bin files (def. 128)" << endl
+       << "  -Z STR           Bin compression: none or gzip (def. none)" << endl
+       << "  -l NUM           gzip compression level 1-9 (def. 1)" << endl
+       << "  -f NUM           Remove bins with fewer than NUM fragments" << endl
+       << "  -I TAXID         Include only bins within clade TAXID (repeatable)" << endl
+       << "  -E TAXID         Exclude bins within clade TAXID (repeatable)" << endl
+       << "  -W STR           Unresolved policy: write or drop (def. write)" << endl
        << "  -O filename      Output file for normal Kraken output" << endl
        << "  -K               In comb. w/ -R, provide minimizer information in report" << endl
        << "  -D               Start a daemon, this options is intended to be used with wrappers" << std::endl

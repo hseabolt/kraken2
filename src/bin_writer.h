@@ -1,6 +1,4 @@
-/*
- * Streaming taxonomic FASTA/FASTQ bin writer for Kraken 2.
- */
+/* Streaming taxonomic FASTA/FASTQ bin writer for Kraken 2. */
 #ifndef KRAKEN2_BIN_WRITER_H_
 #define KRAKEN2_BIN_WRITER_H_
 
@@ -9,6 +7,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <zlib.h>
 
 #include "kraken2_data.h"
 #include "seqreader.h"
@@ -16,10 +15,6 @@
 
 namespace kraken2 {
 
-// Data accumulated by a classification worker for one taxonomic bin in one
-// input block.  taxon is Kraken's internal taxonomy ID.  taxon == 0 is
-// reserved here for a classified read that cannot be resolved to the requested
-// bin rank (e.g. a family-level call when --bin-rank genus is requested).
 struct BinBlock {
   taxid_t taxon = 0;
   std::string mate1_data;
@@ -34,22 +29,23 @@ class BinWriter {
   BinWriter(const Taxonomy &taxonomy,
             const std::string &output_directory,
             const std::string &target_rank,
-            size_t max_open_files = 128);
+            size_t max_open_files = 128,
+            const std::string &compression = "none",
+            int compression_level = 1,
+            uint64_t min_fragments = 1,
+            bool write_unresolved = true);
   ~BinWriter();
 
-  // Idempotent.  All inputs in one run must use the same sequence format and
-  // pairing mode.
   void Initialize(SequenceFormat format, bool paired);
-
-  // Called only from Kraken's ordered output section.
   void WriteBlocks(const std::vector<BinBlock> &blocks);
-
-  // Flush/close bin files and write bins.tsv.  Safe to call more than once.
   void Finalize();
+
+  bool write_unresolved() const { return write_unresolved_; }
 
  private:
   struct OpenStream {
-    std::ofstream *stream = nullptr;
+    std::ofstream *plain = nullptr;
+    gzFile gzip = nullptr;
     uint64_t last_used = 0;
   };
 
@@ -65,6 +61,10 @@ class BinWriter {
   std::string output_directory_;
   std::string target_rank_;
   size_t max_open_files_;
+  std::string compression_;
+  int compression_level_;
+  uint64_t min_fragments_;
+  bool write_unresolved_;
   bool initialized_ = false;
   bool finalized_ = false;
   bool paired_ = false;
@@ -78,7 +78,9 @@ class BinWriter {
   std::map<taxid_t, BinStats> stats_;
 
   void EnsureOutputDirectory();
-  std::ofstream &GetStream(const std::string &pathname);
+  OpenStream &GetStream(const std::string &pathname);
+  void WriteData(const std::string &pathname, const std::string &data);
+  void CloseStream(OpenStream &entry);
   void CloseLeastRecentlyUsed();
   void CloseAll();
 

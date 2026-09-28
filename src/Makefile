@@ -6,7 +6,7 @@ CFLAGS = -Wall -std=c99 -O2 -g
 
 .PHONY: all clean install
 
-PROGS = estimate_capacity build_db classify dump_table lookup_accession_numbers k2mask blast_to_fasta merge libtax.so
+PROGS = estimate_capacity build_db classify dump_table lookup_accession_numbers k2mask blast_to_fasta merge libtax.so bin_reads
 
 all: $(PROGS)
 
@@ -29,7 +29,9 @@ utilities.o: utilities.cc utilities.h
 
 rank_bin_resolver.o: rank_bin_resolver.cc rank_bin_resolver.h taxonomy.h kraken2_data.h
 bin_writer.o: bin_writer.cc bin_writer.h taxonomy.h seqreader.h kraken2_data.h
-classify.o: classify.cc kraken2_data.h kv_store.h taxonomy.h seqreader.h mmscanner.h compact_hash.h aa_translate.h reports.h utilities.h readcounts.h rank_bin_resolver.h bin_writer.h
+bin_selector.o: bin_selector.cc bin_selector.h taxonomy.h kraken2_data.h
+bin_reads.o: bin_reads.cc rank_bin_resolver.h bin_selector.h bin_writer.h taxonomy.h seqreader.h kraken2_data.h
+classify.o: classify.cc kraken2_data.h kv_store.h taxonomy.h seqreader.h mmscanner.h compact_hash.h aa_translate.h reports.h utilities.h readcounts.h rank_bin_resolver.h bin_writer.h bin_selector.h
 dump_table.o: dump_table.cc compact_hash.h taxonomy.h mmscanner.h kraken2_data.h reports.h
 estimate_capacity.o: estimate_capacity.cc kv_store.h mmscanner.h seqreader.h utilities.h
 build_db.o: build_db.cc build_db.h taxonomy.h mmscanner.h seqreader.h compact_hash.h kv_store.h kraken2_data.h utilities.h
@@ -44,8 +46,11 @@ blast_utils.o: blast_utils.c
 build_db: build_db.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o utilities.o
 	$(CXX) $(CXXFLAGS) -o $@ build_db.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o utilities.o $(LDFLAGS)
 
-classify: classify.o rank_bin_resolver.o bin_writer.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o aa_translate.o utilities.o
-	$(CXX) $(CXXFLAGS) -o $@ classify.o rank_bin_resolver.o bin_writer.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o aa_translate.o utilities.o $(LDFLAGS)
+classify: classify.o rank_bin_resolver.o bin_writer.o bin_selector.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o aa_translate.o utilities.o
+	$(CXX) $(CXXFLAGS) -o $@ classify.o rank_bin_resolver.o bin_writer.o bin_selector.o reports.o hyperloglogplus.o mmap_file.o compact_hash.o taxonomy.o seqreader.o mmscanner.o omp_hack.o aa_translate.o utilities.o $(LDFLAGS) -lz
+
+bin_reads: bin_reads.o rank_bin_resolver.o bin_selector.o bin_writer.o taxonomy.o seqreader.o mmap_file.o
+	$(CXX) $(CXXFLAGS) -o $@ bin_reads.o rank_bin_resolver.o bin_selector.o bin_writer.o taxonomy.o seqreader.o mmap_file.o $(LDFLAGS) -lz
 
 estimate_capacity: estimate_capacity.o seqreader.o mmscanner.o omp_hack.o utilities.o
 	$(CXX) $(CXXFLAGS) -o $@ estimate_capacity.o seqreader.o mmscanner.o omp_hack.o utilities.o $(LDFLAGS)
