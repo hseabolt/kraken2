@@ -11,6 +11,7 @@ add_executable(build_db
 add_executable(classify
         classify.cc
         rank_bin_resolver.cc
+        bin_selector.cc
         bin_writer.cc
         reports.cc
         mmap_file.cc
@@ -22,6 +23,18 @@ add_executable(classify
         aa_translate.cc
         utilities.cc
         hyperloglogplus.cc)
+
+target_link_libraries(classify ${ZLIB_LIBRARIES})
+
+add_executable(bin_reads
+        bin_reads.cc
+        rank_bin_resolver.cc
+        bin_selector.cc
+        bin_writer.cc
+        taxonomy.cc
+        seqreader.cc
+        mmap_file.cc)
+target_link_libraries(bin_reads ${ZLIB_LIBRARIES})
 
 add_executable(estimate_capacity
         estimate_capacity.cc
